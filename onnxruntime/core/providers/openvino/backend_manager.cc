@@ -13,17 +13,20 @@
 namespace onnxruntime {
 namespace openvino_ep {
 
-static std::unique_ptr<GlobalContext> g_global_context;
+static GlobalContext* g_global_context;
 
 GlobalContext& BackendManager::GetGlobalContext() {
   // This is not thread safe to call for the first time, but it is first called on the main thread by the constructor so it is safe.
   if (!g_global_context)
-    g_global_context = std::make_unique<GlobalContext>();
+    g_global_context = new GlobalContext();
   return *g_global_context;
 }
 
 void BackendManager::ReleaseGlobalContext() {
-  g_global_context.reset();
+  if (g_global_context) {
+    delete g_global_context;
+    g_global_context = nullptr;
+  }
 }
 
 BackendManager::BackendManager(const Node* fused_node, const logging::Logger& logger) {
@@ -186,7 +189,7 @@ std::string MakeMapKeyString(std::vector<std::vector<int64_t>>& shapes,
                              std::string& device_type) {
   std::string key;
   key += device_type;
-  key += "|";  //separator
+  key += "|";  // separator
   for (auto shape : shapes) {
     for (auto dim : shape) {
       std::ostringstream o;

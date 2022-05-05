@@ -59,8 +59,17 @@ extern std::unique_ptr<Ort::Env> ort_env;
   } while (false)
 
 using namespace onnxruntime::common;
-
+#ifdef USE_XNNPACK
+#include "core/framework/customregistry.h"
+#endif
 namespace onnxruntime {
+
+#ifdef USE_XNNPACK
+namespace xnnpack {
+Status GetXNNPackRegistry(CustomRegistry** xnnpack_registry);
+}
+#endif
+
 namespace test {
 // parameter is provider_name + "_" + model_path
 class ModelTest : public testing::TestWithParam<std::basic_string<ORTCHAR_T>> {};
@@ -717,6 +726,11 @@ TEST_P(ModelTest, Run) {
       }
       std::unique_ptr<OrtSession, decltype(&OrtApis::ReleaseSession)> rel_ort_session(ort_session,
                                                                                       &OrtApis::ReleaseSession);
+#ifdef USE_XNNPACK
+      CustomRegistry* reg = nullptr;
+      ASSERT_STATUS_OK(xnnpack::GetXNNPackRegistry(&reg));
+      ASSERT_STATUS_OK(reinterpret_cast<InferenceSession*>(ort_session)->RegisterCustomRegistry(std::shared_ptr<CustomRegistry>(reg)));
+#endif
       const size_t data_count = l->GetDataCount();
       auto default_allocator = std::make_unique<MockedOrtAllocator>();
 
@@ -1069,6 +1083,10 @@ TEST_P(ModelTest, Run) {
 #if !defined(_WIN32) && !defined(USE_OPENVINO)
     paths.push_back("/data/onnx");
 #endif
+
+    if (Env::Default().FolderExists(ORT_TSTR("simple"))) {
+      paths.push_back(ORT_TSTR("simple"));
+    }
     while (!paths.empty()) {
       std::basic_string<ORTCHAR_T> node_data_root_path = paths.back();
       paths.pop_back();

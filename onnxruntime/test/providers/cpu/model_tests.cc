@@ -59,16 +59,10 @@ extern std::unique_ptr<Ort::Env> ort_env;
   } while (false)
 
 using namespace onnxruntime::common;
-#ifdef USE_XNNPACK
-#include "core/framework/customregistry.h"
-#endif
+
 namespace onnxruntime {
 
-#ifdef USE_XNNPACK
-namespace xnnpack {
-Status GetXNNPackRegistry(CustomRegistry** xnnpack_registry);
-}
-#endif
+
 
 namespace test {
 // parameter is provider_name + "_" + model_path
@@ -726,11 +720,6 @@ TEST_P(ModelTest, Run) {
       }
       std::unique_ptr<OrtSession, decltype(&OrtApis::ReleaseSession)> rel_ort_session(ort_session,
                                                                                       &OrtApis::ReleaseSession);
-#ifdef USE_XNNPACK
-      CustomRegistry* reg = nullptr;
-      ASSERT_STATUS_OK(xnnpack::GetXNNPackRegistry(&reg));
-      ASSERT_STATUS_OK(reinterpret_cast<InferenceSession*>(ort_session)->RegisterCustomRegistry(std::shared_ptr<CustomRegistry>(reg)));
-#endif
       const size_t data_count = l->GetDataCount();
       auto default_allocator = std::make_unique<MockedOrtAllocator>();
 

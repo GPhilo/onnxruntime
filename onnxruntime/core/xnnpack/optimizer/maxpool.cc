@@ -48,8 +48,8 @@ bool IsMaxPoolSupportedByXNNPack(const Node& nodeRef, bool input_is_nchw) {
   return true;
 }
 
-
-Status ReplaceMaxPool(Graph& main_graph, Node& nodeRef, bool& modified) {
+Status ReplaceMaxPool(const Node& nodeRef, std::unique_ptr<::ONNX_NAMESPACE::GraphProto>& output_graph) {
+  if (!IsMaxPoolSupportedByXNNPack(nodeRef, true)) return Status::OK();
   ProtoHelperNodeContext nc(nodeRef);
   OpNodeProtoHelper info(&nc);
   PoolAttributes pool_attrs(info, "MaxPool", nodeRef.SinceVersion());
@@ -62,8 +62,6 @@ Status ReplaceMaxPool(Graph& main_graph, Node& nodeRef, bool& modified) {
   if (shape == nullptr || shape->dim_size() != 4) {
     return Status::OK();
   }
-
-  modified = true;
 
   std::unordered_map<std::string, ONNX_NAMESPACE::AttributeProto> attrs;
   AddAttribute(attrs, "input_padding_top", pool_attrs.pads[0]);
@@ -85,26 +83,16 @@ Status ReplaceMaxPool(Graph& main_graph, Node& nodeRef, bool& modified) {
     AddAttribute(attrs, "padding_mode", static_cast<int64_t>(0));
   }
 
-  ::ONNX_NAMESPACE::GraphProto g;
+  ::ONNX_NAMESPACE::GraphProto& g = *(output_graph = std::make_unique<::ONNX_NAMESPACE::GraphProto>());
   const ::ONNX_NAMESPACE::ValueInfoProto& subgraph_input = *g.add_input() = nodeRef.InputDefs()[0]->ToProto();
   const ::ONNX_NAMESPACE::ValueInfoProto& subgraph_output = *g.add_output() = nodeRef.OutputDefs()[0]->ToProto();
+  constexpr int rank = 4;
 
-  std::string trans_output;
-  {
-    ::ONNX_NAMESPACE::NodeProto* input_trans = g.add_node();
-    input_trans->set_name("0");
-    input_trans->set_domain(kOnnxDomain);
-    input_trans->set_op_type("Transpose");
-    ::ONNX_NAMESPACE::AttributeProto* attr = input_trans->add_attribute();
-    attr->set_name("perm");
-    constexpr int rank = 4;
-    std::vector<int64_t> input_perm = onnx_layout_transformation::ChannelFirstToLastPerm(rank);
-    for (int64_t i : input_perm) attr->add_ints(i);
-    attr->set_type(::onnx::AttributeProto_AttributeType::AttributeProto_AttributeType_INTS);
-    input_trans->add_input(subgraph_input.name());
-    trans_output = subgraph_input.name() + "_x";
-    input_trans->add_output(trans_output);
-  }
+  std::string trans_output = subgraph_input.name() + "_x";
+
+  ORT_RETURN_IF_ERROR(CreateTransposeNode(*g.add_node(), "0", subgraph_input.name(), trans_output,
+                                          onnx_layout_transformation::ChannelFirstToLastPerm(rank)));
+
   std::string conv_output;
   {
     ::ONNX_NAMESPACE::NodeProto* xnnPackMaxPooling2d = g.add_node();
@@ -118,22 +106,9 @@ Status ReplaceMaxPool(Graph& main_graph, Node& nodeRef, bool& modified) {
     conv_output = subgraph_input.name() + "_y";
     xnnPackMaxPooling2d->add_output(conv_output);
   }
-  {
-    ::ONNX_NAMESPACE::NodeProto* input_trans = g.add_node();
-    input_trans->set_name("2");
-    input_trans->set_domain(kOnnxDomain);
-    input_trans->set_op_type("Transpose");
-    ::ONNX_NAMESPACE::AttributeProto* attr = input_trans->add_attribute();
-    attr->set_name("perm");
-    constexpr int rank = 4;
-    std::vector<int64_t> input_perm = onnx_layout_transformation::ChannelLastToFirstPerm(rank);
-    for (int64_t i : input_perm) attr->add_ints(i);
-    attr->set_type(::onnx::AttributeProto_AttributeType::AttributeProto_AttributeType_INTS);
-    input_trans->add_input(conv_output);
-    input_trans->add_output(subgraph_output.name());
-  }
 
-  nodeRef.SetFunctionBody(std::make_unique<TrivalSubgraph>(main_graph, nodeRef, g));
-  return main_graph.InlineFunction(nodeRef);
+  ORT_RETURN_IF_ERROR(CreateTransposeNode(*g.add_node(), "2", conv_output, subgraph_output.name(),
+                                          onnx_layout_transformation::ChannelLastToFirstPerm(rank)));
+  return Status::OK();
 }
 }  // namespace onnxruntime

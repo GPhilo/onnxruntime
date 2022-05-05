@@ -19,63 +19,6 @@
 #include "core/xnnpack/optimizer/layout_helper.h"
 #include "core/xnnpack/optimizer/trival_subgraph.h"
 namespace onnxruntime {
-Status IsConvSupportedByXNNPack(const Node& nodeRef, std::unordered_set<const NodeArg*>& graph_const_values,
-                                bool input_is_nchw) {
-  if (nodeRef.OpType() != "Conv") return Status(common::ONNXRUNTIME, common::FAIL);
-  // Conv has either 2 or 3 inputs.
-  auto input_defs = nodeRef.InputDefs();
-  if (input_defs.size() != 2 && input_defs.size() != 3) return Status(common::ONNXRUNTIME, common::FAIL);
-  if (graph_const_values.find(input_defs[1]) == graph_const_values.end()) {
-    // Weight is not const, we can't run it.
-    return Status(common::ONNXRUNTIME, common::FAIL);
-  }
-  // The two or three inputs are: X, W, B
-  const NodeArg* weight_node_arg = input_defs[1];
-  if (weight_node_arg == nullptr) return Status(common::ONNXRUNTIME, common::FAIL);
-  // Weight must be a const and all dims are known
-  bool is_weight_shape_known = optimizer_utils::IsShapeKnownOnAllDims(*weight_node_arg, 4);
-  if (!is_weight_shape_known) return Status(common::ONNXRUNTIME, common::FAIL);
-
-  ProtoHelperNodeContext nc(nodeRef);
-  OpNodeProtoHelper info(&nc);
-  auto X_input = input_defs[0]->TypeAsProto();
-  if (X_input == nullptr || !X_input->has_tensor_type() || !X_input->tensor_type().has_shape() ||
-      X_input->tensor_type().elem_type() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
-    return Status(common::ONNXRUNTIME, common::FAIL);
-  std::string auto_pad_str;
-  ORT_RETURN_IF_ERROR(info.GetAttr<std::string>("auto_pad", &auto_pad_str));
-  AutoPadType padding_type = StringToAutoPadType(auto_pad_str);
-  if (!IsPaddingTypeSupportedByXNNPack(padding_type)) return Status(common::ONNXRUNTIME, common::FAIL);
-  // The "auto_pad_str" string must be either NOTSET, SAME_UPPER, SAME_LOWER or VALID
-  // TF2ONNX converter doesn't use SAME_LOWER.
-  // SAME_UPPER maps to TF SAME padding
-  if (padding_type == AutoPadType::SAME_UPPER) {
-    std::vector<int64_t> dilations;
-    Status st1 = info.GetAttrs<int64_t>("dilations", dilations);
-    if (dilations.size() != 2) return Status(common::ONNXRUNTIME, common::FAIL);
-    // Don't know how to handle dilation!=1 cases yet. TF doesn't have it.
-    if (dilations[0] != 1 || dilations[1] != 1) return Status(common::ONNXRUNTIME, common::FAIL);
-  }
-
-  auto& input_shape = X_input->tensor_type().shape();
-  if (input_shape.dim_size() != 4) return Status(common::ONNXRUNTIME, common::FAIL);
-  auto& channel_dim = input_is_nchw ? input_shape.dim(1) : input_shape.dim(3);
-  if (!channel_dim.has_dim_value()) return Status(common::ONNXRUNTIME, common::FAIL);
-
-  auto weight_input = weight_node_arg->TypeAsProto();
-  TensorShape weight_shape = utils::GetTensorShapeFromTensorShapeProto(weight_input->tensor_type().shape());
-  int64_t group = 1;
-  ORT_RETURN_IF_ERROR(info.GetAttr<int64_t>("group", &group));
-  int64_t input_channels = input_is_nchw ? input_shape.dim(1).dim_value() : input_shape.dim(3).dim_value();
-  if (group != 1 && group != input_channels) return Status(common::ONNXRUNTIME, common::FAIL);
-
-  std::vector<int64_t> pads;
-  Status st = info.GetAttrs<int64_t>("pads", pads);
-  if (st.IsOK()) {
-    if (pads.size() != 4) return Status(common::ONNXRUNTIME, common::FAIL);
-  }
-  return Status::OK();
-}
 
 Status AddBiasInitializer(Graph& main_graph, int64_t bias_size, const std::string& bias_tensor_name, NodeArg** out) {
   if (bias_size < 0 || static_cast<uint64_t>(bias_size) >= std::numeric_limits<size_t>::max()) {
@@ -92,7 +35,65 @@ Status AddBiasInitializer(Graph& main_graph, int64_t bias_size, const std::strin
   return Status::OK();
 }
 
-Status ReplaceConv(Graph& main_graph, Node& nodeRef, bool& modified) {
+Status ReplaceConv(const Node& nodeRef, const std::unordered_set<const NodeArg*>& graph_const_values,
+                   std::unique_ptr<::ONNX_NAMESPACE::GraphProto>& output_graph) {
+  {
+    if (nodeRef.OpType() != "Conv") return Status(common::ONNXRUNTIME, common::FAIL);
+    constexpr bool input_is_nchw = true;
+    // Conv has either 2 or 3 inputs.
+    auto input_defs = nodeRef.InputDefs();
+    if (input_defs.size() != 2 && input_defs.size() != 3) return Status(common::ONNXRUNTIME, common::FAIL);
+    if (graph_const_values.find(input_defs[1]) == graph_const_values.end()) {
+      // Weight is not const, we can't run it.
+      return Status(common::ONNXRUNTIME, common::FAIL);
+    }
+    // The two or three inputs are: X, W, B
+    const NodeArg* weight_node_arg = input_defs[1];
+    if (weight_node_arg == nullptr) return Status(common::ONNXRUNTIME, common::FAIL);
+    // Weight must be a const and all dims are known
+    bool is_weight_shape_known = optimizer_utils::IsShapeKnownOnAllDims(*weight_node_arg, 4);
+    if (!is_weight_shape_known) return Status(common::ONNXRUNTIME, common::FAIL);
+
+    ProtoHelperNodeContext nc(nodeRef);
+    OpNodeProtoHelper info(&nc);
+    auto X_input = input_defs[0]->TypeAsProto();
+    if (X_input == nullptr || !X_input->has_tensor_type() || !X_input->tensor_type().has_shape() ||
+        X_input->tensor_type().elem_type() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+      return Status(common::ONNXRUNTIME, common::FAIL);
+    std::string auto_pad_str;
+    ORT_RETURN_IF_ERROR(info.GetAttr<std::string>("auto_pad", &auto_pad_str));
+    AutoPadType padding_type = StringToAutoPadType(auto_pad_str);
+    if (!IsPaddingTypeSupportedByXNNPack(padding_type)) return Status(common::ONNXRUNTIME, common::FAIL);
+    // The "auto_pad_str" string must be either NOTSET, SAME_UPPER, SAME_LOWER or VALID
+    // TF2ONNX converter doesn't use SAME_LOWER.
+    // SAME_UPPER maps to TF SAME padding
+    if (padding_type == AutoPadType::SAME_UPPER) {
+      std::vector<int64_t> dilations;
+      Status st1 = info.GetAttrs<int64_t>("dilations", dilations);
+      if (dilations.size() != 2) return Status(common::ONNXRUNTIME, common::FAIL);
+      // Don't know how to handle dilation!=1 cases yet. TF doesn't have it.
+      if (dilations[0] != 1 || dilations[1] != 1) return Status(common::ONNXRUNTIME, common::FAIL);
+    }
+
+    auto& input_shape = X_input->tensor_type().shape();
+    if (input_shape.dim_size() != 4) return Status(common::ONNXRUNTIME, common::FAIL);
+    auto& channel_dim = input_is_nchw ? input_shape.dim(1) : input_shape.dim(3);
+    if (!channel_dim.has_dim_value()) return Status(common::ONNXRUNTIME, common::FAIL);
+
+    auto weight_input = weight_node_arg->TypeAsProto();
+    TensorShape weight_shape = utils::GetTensorShapeFromTensorShapeProto(weight_input->tensor_type().shape());
+    int64_t group = 1;
+    ORT_RETURN_IF_ERROR(info.GetAttr<int64_t>("group", &group));
+    int64_t input_channels = input_is_nchw ? input_shape.dim(1).dim_value() : input_shape.dim(3).dim_value();
+    if (group != 1 && group != input_channels) return Status(common::ONNXRUNTIME, common::FAIL);
+
+    std::vector<int64_t> pads;
+    Status st = info.GetAttrs<int64_t>("pads", pads);
+    if (st.IsOK()) {
+      if (pads.size() != 4) return Status(common::ONNXRUNTIME, common::FAIL);
+    }
+  }
+
   ProtoHelperNodeContext nc(nodeRef);
   OpNodeProtoHelper info(&nc);
   int64_t group = 1;
@@ -110,7 +111,6 @@ Status ReplaceConv(Graph& main_graph, Node& nodeRef, bool& modified) {
   for (size_t i = 0; i != weight_shape.NumDimensions(); ++i) {
     if (weight_shape[i] <= 0) return Status::OK();
   }
-  modified = true;
 
   // const_cast
   const bool has_bias = nodeRef.InputDefs().size() >= 3;
@@ -171,7 +171,7 @@ Status ReplaceConv(Graph& main_graph, Node& nodeRef, bool& modified) {
     return Status(common::ONNXRUNTIME, common::NOT_IMPLEMENTED);
   }
 
-  ::ONNX_NAMESPACE::GraphProto g;
+  ::ONNX_NAMESPACE::GraphProto& g = *(output_graph = std::make_unique<::ONNX_NAMESPACE::GraphProto>());
   const ::ONNX_NAMESPACE::ValueInfoProto& subgraph_input0 = *g.add_input() = nodeRef.InputDefs()[0]->ToProto();
   const ::ONNX_NAMESPACE::ValueInfoProto& subgraph_input1 = *g.add_input() = nodeRef.InputDefs()[1]->ToProto();
   ::ONNX_NAMESPACE::ValueInfoProto* subgraph_input2 = nullptr;
@@ -180,43 +180,20 @@ Status ReplaceConv(Graph& main_graph, Node& nodeRef, bool& modified) {
     *subgraph_input2 = nodeRef.InputDefs()[2]->ToProto();
   }
   const ::ONNX_NAMESPACE::ValueInfoProto& subgraph_output = *g.add_output() = nodeRef.OutputDefs()[0]->ToProto();
-  std::string trans0_output;
-  std::string trans1_output;
+  std::string trans0_output = subgraph_input0.name() + "_x";
+  std::string trans1_output = subgraph_input1.name() + "_y";
+
   // Transpose input
-  {
-    ::ONNX_NAMESPACE::NodeProto* input_trans = g.add_node();
-    input_trans->set_name("0");
-    input_trans->set_domain(kOnnxDomain);
-    input_trans->set_op_type("Transpose");
-    ::ONNX_NAMESPACE::AttributeProto* attr = input_trans->add_attribute();
-    attr->set_name("perm");
-    constexpr int rank = 4;
-    std::vector<int64_t> input_perm = onnx_layout_transformation::ChannelFirstToLastPerm(rank);
-    for (int64_t i : input_perm) attr->add_ints(i);
-    attr->set_type(::onnx::AttributeProto_AttributeType::AttributeProto_AttributeType_INTS);
-    input_trans->add_input(subgraph_input0.name());
-    trans0_output = subgraph_input0.name() + "_x";
-    input_trans->add_output(trans0_output);
-  }
-  // Transpose weight
-  {
-    ::ONNX_NAMESPACE::NodeProto* input_trans = g.add_node();
-    input_trans->set_name("1");
-    input_trans->set_domain(kOnnxDomain);
-    input_trans->set_op_type("Transpose");
-    ::ONNX_NAMESPACE::AttributeProto* attr = input_trans->add_attribute();
-    attr->set_name("perm");
-    for (int64_t i : weight_perm) attr->add_ints(i);
-    attr->set_type(::onnx::AttributeProto_AttributeType::AttributeProto_AttributeType_INTS);
-    input_trans->add_input(subgraph_input1.name());
-    trans1_output = subgraph_input1.name() + "_y";
-    input_trans->add_output(trans1_output);
-  }
+  constexpr int rank = 4;
+
+  ORT_RETURN_IF_ERROR(CreateTransposeNode(*g.add_node(), "0", subgraph_input0.name(), trans0_output,
+                                          onnx_layout_transformation::ChannelFirstToLastPerm(rank)));
+  ORT_RETURN_IF_ERROR(CreateTransposeNode(*g.add_node(), "1", subgraph_input1.name(), trans1_output, weight_perm));
   std::string conv_output;
   std::string bias_tensor_name;
   if (!has_bias) {
     int64_t bias_size = weight_shape[0];
-    bias_tensor_name = main_graph.GenerateNodeArgName(nodeRef.Name() + "_bias");
+    bias_tensor_name = nodeRef.Name() + "_bias";
     if (bias_size < 0 || static_cast<uint64_t>(bias_size) >= std::numeric_limits<size_t>::max()) {
       return Status(common::ONNXRUNTIME, common::INVALID_ARGUMENT, "size is too large");
     }
@@ -225,10 +202,11 @@ Status ReplaceConv(Graph& main_graph, Node& nodeRef, bool& modified) {
     TensorShape shape({bias_size});
     std::vector<float> data(static_cast<size_t>(bias_size), 0.0f);
 
-    *t = utils::TensorToTensorProto(*Tensor::Create(DataTypeImpl::GetType<float>(), shape, data.data(),
-                                        OrtMemoryInfo(onnxruntime::CPU, OrtAllocatorType::OrtDeviceAllocator)),
-                            bias_tensor_name);
-    
+    *t = utils::TensorToTensorProto(
+        *Tensor::Create(DataTypeImpl::GetType<float>(), shape, data.data(),
+                        OrtMemoryInfo(onnxruntime::CPU, OrtAllocatorType::OrtDeviceAllocator)),
+        bias_tensor_name);
+
   } else {
     bias_tensor_name = subgraph_input2->name();
   }
@@ -246,21 +224,8 @@ Status ReplaceConv(Graph& main_graph, Node& nodeRef, bool& modified) {
     conv_output = subgraph_input0.name() + "_y";
     xnnPackConv2d->add_output(conv_output);
   }
-  {
-    ::ONNX_NAMESPACE::NodeProto* input_trans = g.add_node();
-    input_trans->set_name("3");
-    input_trans->set_domain(kOnnxDomain);
-    input_trans->set_op_type("Transpose");
-    ::ONNX_NAMESPACE::AttributeProto* attr = input_trans->add_attribute();
-    attr->set_name("perm");
-    constexpr int rank = 4;
-    std::vector<int64_t> input_perm = onnx_layout_transformation::ChannelLastToFirstPerm(rank);
-    for (int64_t i : input_perm) attr->add_ints(i);
-    attr->set_type(::onnx::AttributeProto_AttributeType::AttributeProto_AttributeType_INTS);
-    input_trans->add_input(conv_output);
-    input_trans->add_output(subgraph_output.name());
-  }
-  nodeRef.SetFunctionBody(std::make_unique<TrivalSubgraph>(main_graph, nodeRef, g));
-  return main_graph.InlineFunction(nodeRef);
+  ORT_RETURN_IF_ERROR(CreateTransposeNode(*g.add_node(), "3", conv_output, subgraph_output.name(),
+                                          onnx_layout_transformation::ChannelLastToFirstPerm(rank)));
+  return Status::OK();
 }
 }  // namespace onnxruntime

@@ -15,9 +15,9 @@
 #include "core/optimizer/utils.h"
 #include "core/providers/cpu/nn/pool_attributes.h"
 #include "core/xnnpack/optimizer/common.h"
-#include "core/xnnpack/optimizer/conv_helper.h"
 #include "core/xnnpack/optimizer/maxpool.h"
 #include "core/xnnpack/optimizer/conv.h"
+#include "core/xnnpack/optimizer/trival_subgraph.h"
 
 using namespace ONNX_NAMESPACE;
 using namespace ::onnxruntime::common;
@@ -65,8 +65,7 @@ Status XNNPackTransformer::ApplyImpl(Graph& main_graph, bool& modified, int grap
     ORT_RETURN_IF_ERROR(Recurse(node, modified, graph_level, logger));
   }
 
-  std::vector<NodeIndex> conv_nodes;
-  std::vector<NodeIndex> maxpool_nodes;
+  std::vector<Node*> updated_nodes;
   // Iterate all the nodes first to figure out what can be run by XNNPack. Then we will update the selected nodes one by
   // one. However, there could be chance that in the first pass we thought a node is supported by XNNPack, then we did
   // some updates on the graph which break the assumption. For example, if there is a Maxpool followd by a Conv. At
@@ -81,28 +80,22 @@ Status XNNPackTransformer::ApplyImpl(Graph& main_graph, bool& modified, int grap
     if (nodeRef.OpType() == "DequantizeLinear") {
       return Status::OK();
     }
-    Status st = IsConvSupportedByXNNPack(nodeRef, graph_const_values, true);
-    if (st.IsOK()) {
-      conv_nodes.push_back(nodeRef.Index());
-    } else if (IsMaxPoolSupportedByXNNPack(nodeRef, true)) {
-      maxpool_nodes.push_back(nodeRef.Index());
+    std::unique_ptr<::ONNX_NAMESPACE::GraphProto> subgraph;
+    Status st = ReplaceMaxPool(nodeRef, subgraph);
+    if (!st.IsOK() || !subgraph) {
+      st = ReplaceConv(nodeRef, graph_const_values, subgraph);
     }
+    if (st.IsOK() && subgraph.get() != nullptr) {
+      Node* node_p = main_graph.GetNode(nodeRef.Index());
+      if (node_p == nullptr) continue;
+      node_p->SetFunctionBody(std::make_unique<TrivalSubgraph>(main_graph, nodeRef, std::move(subgraph)));
+      updated_nodes.push_back(node_p);
+    }    
   }
-  for (NodeIndex ni : maxpool_nodes) {
-    Node* node_p = main_graph.GetNode(ni);
-    if (node_p == nullptr) continue;
-    bool node_modified = false;
-    ORT_RETURN_IF_ERROR(ReplaceMaxPool(main_graph, *node_p, node_modified));
-    modified |= node_modified;
+  for (Node* node_p : updated_nodes) {
+    ORT_RETURN_IF_ERROR(main_graph.InlineFunction(*node_p));
   }
-
-  for (NodeIndex ni : conv_nodes) {
-    Node* node_p = main_graph.GetNode(ni);
-    if (node_p == nullptr) continue;
-    bool node_modified = false;
-    ORT_RETURN_IF_ERROR(ReplaceConv(main_graph, *node_p, node_modified));
-    modified |= node_modified;
-  }
+  modified = !updated_nodes.empty();
   if (modified) {
     ORT_RETURN_IF_ERROR(main_graph.Resolve());
     auto api_graph = MakeApiGraph(main_graph, cpu_allocator_, kCpuExecutionProvider);

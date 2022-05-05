@@ -9,12 +9,12 @@ namespace onnxruntime {
 
 class TrivalSubgraph : public Function {
  private:
-  ONNX_NAMESPACE::GraphProto p_;
+  std::unique_ptr<ONNX_NAMESPACE::GraphProto> p_;
   Graph g_;
 
  public:
-  TrivalSubgraph(Graph& parent_graph, const Node& parent_node, const ONNX_NAMESPACE::GraphProto& p)
-      : p_(p), g_(parent_graph, parent_node, p_) {
+  TrivalSubgraph(Graph& parent_graph, const Node& parent_node, std::unique_ptr<ONNX_NAMESPACE::GraphProto> p)
+      : p_(std::move(p)), g_(parent_graph, parent_node, *p_) {
 
   };
 
